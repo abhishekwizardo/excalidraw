@@ -35,15 +35,14 @@ import {
 import polyfill from "@excalidraw/excalidraw/polyfill";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
+import { serializeAsJSON } from "@excalidraw/excalidraw/data/json";
 import { t } from "@excalidraw/excalidraw/i18n";
 
 import {
   GithubIcon,
   XBrandIcon,
   DiscordIcon,
-  ExcalLogo,
   usersIcon,
-  exportToPlus,
   share,
   youtubeIcon,
 } from "@excalidraw/excalidraw/components/icons";
@@ -89,7 +88,6 @@ import {
 } from "./app-jotai";
 import {
   FIREBASE_STORAGE_PREFIXES,
-  isExcalidrawPlusSignedUser,
   STORAGE_KEYS,
   SYNC_BROWSER_TABS_TIMEOUT,
 } from "./app_constants";
@@ -102,10 +100,7 @@ import Collab, {
 import { AppFooter } from "./components/AppFooter";
 import { AppMainMenu } from "./components/AppMainMenu";
 import { AppWelcomeScreen } from "./components/AppWelcomeScreen";
-import {
-  ExportToExcalidrawPlus,
-  exportToExcalidrawPlus,
-} from "./components/ExportToExcalidrawPlus";
+import { DesktopLibrary } from "./components/DesktopLibrary";
 import { TopErrorBoundary } from "./components/TopErrorBoundary";
 
 import {
@@ -142,12 +137,8 @@ import DebugCanvas, {
 } from "./components/DebugCanvas";
 import { useSimulatedCollaborators } from "./debugCollaborators";
 import { AIComponents } from "./components/AI";
-import { ExcalidrawPlusIframeExport } from "./ExcalidrawPlusIframeExport";
 
 import "./index.scss";
-
-import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanner";
-import { AppSidebar } from "./components/AppSidebar";
 
 import type { CollabAPI } from "./collab/Collab";
 
@@ -188,6 +179,17 @@ window.addEventListener(
 );
 
 let isSelfEmbedding = false;
+
+const serializeDesktopScene = (
+  elements: readonly OrderedExcalidrawElement[],
+  appState: AppState,
+  files: BinaryFiles,
+  name: string,
+) => {
+  const data = JSON.parse(serializeAsJSON(elements, appState, files, "local"));
+  data.appState = { ...data.appState, name };
+  return JSON.stringify(data, null, 2);
+};
 
 if (window.self !== window.top) {
   try {
@@ -230,7 +232,9 @@ const initializeScene = async (opts: {
   );
   const externalUrlMatch = window.location.hash.match(/^#url=(.*)$/);
 
-  const localDataState = importFromLocalStorage();
+  const localDataState = window.excalidrawDesktop
+    ? null
+    : importFromLocalStorage();
 
   let scene: Omit<
     RestoredDataState,
@@ -376,6 +380,20 @@ const ExcalidrawWrapper = () => {
   const excalidrawAPI = useExcalidrawAPI();
 
   const [errorMessage, setErrorMessage] = useState("");
+  const isDesktopApp = !!window.excalidrawDesktop;
+  const [isDesktopLibraryOpen, setIsDesktopLibraryOpen] =
+    useState(isDesktopApp);
+  const desktopDrawingIdRef = useRef<string | null>(null);
+  const [desktopSaveStatus, setDesktopSaveStatus] = useState<
+    "saved" | "saving" | "error"
+  >("saved");
+  const desktopSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const desktopSnapshotRef = useRef<string | null>(null);
+  const desktopPendingSceneRef = useRef<{
+    elements: readonly OrderedExcalidrawElement[];
+    appState: AppState;
+    files: BinaryFiles;
+  } | null>(null);
   const isCollabDisabled = isRunningInIframe();
 
   const { editorTheme, appTheme, setAppTheme } = useHandleAppTheme();
@@ -603,7 +621,10 @@ const ExcalidrawWrapper = () => {
         ((collabAPI && !collabAPI.isCollaborating()) || isCollabDisabled)
       ) {
         // don't sync if local state is newer or identical to browser state
-        if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)) {
+        if (
+          !window.excalidrawDesktop &&
+          isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)
+        ) {
           const localDataState = importFromLocalStorage();
           const username = importUsernameFromLocalStorage();
           setLangCode(getPreferredLanguage());
@@ -689,6 +710,27 @@ const ExcalidrawWrapper = () => {
 
   useEffect(() => {
     const unloadHandler = (event: BeforeUnloadEvent) => {
+      if (window.excalidrawDesktop) {
+        if (desktopSaveTimer.current) {
+          clearTimeout(desktopSaveTimer.current);
+        }
+        const id = desktopDrawingIdRef.current;
+        const pendingScene = desktopPendingSceneRef.current;
+        const snapshot = pendingScene
+          ? serializeDesktopScene(
+              pendingScene.elements,
+              pendingScene.appState,
+              pendingScene.files,
+              pendingScene.appState.name ||
+                excalidrawAPI?.getName() ||
+                "Untitled drawing",
+            )
+          : desktopSnapshotRef.current;
+        if (id && snapshot) {
+          void window.excalidrawDesktop.saveDrawing(id, snapshot);
+        }
+        return;
+      }
       LocalData.flushSave();
 
       if (
@@ -712,6 +754,35 @@ const ExcalidrawWrapper = () => {
     };
   }, [excalidrawAPI]);
 
+  useEffect(() => {
+    if (!window.excalidrawDesktop) {
+      return;
+    }
+    return window.excalidrawDesktop.onBeforeClose(async () => {
+      if (desktopSaveTimer.current) {
+        clearTimeout(desktopSaveTimer.current);
+        desktopSaveTimer.current = null;
+      }
+      const id = desktopDrawingIdRef.current;
+      const pendingScene = desktopPendingSceneRef.current;
+      const snapshot = pendingScene
+        ? serializeDesktopScene(
+            pendingScene.elements,
+            pendingScene.appState,
+            pendingScene.files,
+            pendingScene.appState.name || "Untitled drawing",
+          )
+        : desktopSnapshotRef.current;
+      try {
+        if (id && snapshot) {
+          await window.excalidrawDesktop?.saveDrawing(id, snapshot);
+        }
+      } finally {
+        window.excalidrawDesktop?.readyToClose();
+      }
+    });
+  }, []);
+
   const onChange = (
     elements: readonly OrderedExcalidrawElement[],
     appState: AppState,
@@ -719,6 +790,37 @@ const ExcalidrawWrapper = () => {
   ) => {
     if (collabAPI?.isCollaborating()) {
       collabAPI.syncElements(elements);
+    }
+
+    if (window.excalidrawDesktop && desktopDrawingIdRef.current) {
+      desktopPendingSceneRef.current = { elements, appState, files };
+      if (desktopSaveTimer.current) {
+        clearTimeout(desktopSaveTimer.current);
+      }
+      setDesktopSaveStatus("saving");
+      const id = desktopDrawingIdRef.current;
+      desktopSaveTimer.current = setTimeout(() => {
+        const pendingScene = desktopPendingSceneRef.current;
+        if (!pendingScene) {
+          return;
+        }
+        const snapshot = serializeDesktopScene(
+          pendingScene.elements,
+          pendingScene.appState,
+          pendingScene.files,
+          pendingScene.appState.name || "Untitled drawing",
+        );
+        desktopPendingSceneRef.current = null;
+        desktopSnapshotRef.current = snapshot;
+        window.excalidrawDesktop
+          ?.saveDrawing(id, snapshot)
+          .then(() => setDesktopSaveStatus("saved"))
+          .catch(() => setDesktopSaveStatus("error"));
+      }, 700);
+      return;
+    }
+    if (window.excalidrawDesktop) {
+      return;
     }
 
     // this check is redundant, but since this is a hot path, it's best
@@ -762,6 +864,138 @@ const ExcalidrawWrapper = () => {
         window.devicePixelRatio,
       );
     }
+  };
+
+  const flushDesktopPendingSave = async () => {
+    const id = desktopDrawingIdRef.current;
+    if (!id || !window.excalidrawDesktop) {
+      return;
+    }
+    if (desktopSaveTimer.current) {
+      clearTimeout(desktopSaveTimer.current);
+      desktopSaveTimer.current = null;
+    }
+    const pendingScene = desktopPendingSceneRef.current;
+    if (!pendingScene) {
+      return;
+    }
+    const snapshot = serializeDesktopScene(
+      pendingScene.elements,
+      pendingScene.appState,
+      pendingScene.files,
+      pendingScene.appState.name ||
+        excalidrawAPI?.getName() ||
+        "Untitled drawing",
+    );
+    desktopPendingSceneRef.current = null;
+    desktopSnapshotRef.current = snapshot;
+    try {
+      await window.excalidrawDesktop.saveDrawing(id, snapshot);
+      setDesktopSaveStatus("saved");
+    } catch (error) {
+      setDesktopSaveStatus("error");
+      throw error;
+    }
+  };
+
+  const openDesktopDrawing = async (id: string, isNew = false) => {
+    if (!window.excalidrawDesktop) {
+      return;
+    }
+    if (!excalidrawAPI) {
+      setTimeout(() => void openDesktopDrawing(id, isNew), 50);
+      return;
+    }
+    try {
+      try {
+        await flushDesktopPendingSave();
+      } catch (error) {
+        console.error(error);
+        setErrorMessage(
+          "Could not save the latest changes. They are still open in the editor; retry the save before switching drawings.",
+        );
+        return;
+      }
+      desktopDrawingIdRef.current = id;
+      desktopSnapshotRef.current = null;
+      desktopPendingSceneRef.current = null;
+      setDesktopSaveStatus("saved");
+
+      if (isNew) {
+        excalidrawAPI.resetScene();
+        excalidrawAPI.updateScene({
+          appState: { name: "Untitled drawing" },
+          captureUpdate: CaptureUpdateAction.NEVER,
+        });
+        const initialData = JSON.parse(
+          serializeAsJSON([], getDefaultAppState(), {}, "local"),
+        );
+        initialData.appState = {
+          ...initialData.appState,
+          name: "Untitled drawing",
+        };
+        const snapshot = JSON.stringify(initialData, null, 2);
+        desktopSnapshotRef.current = snapshot;
+        await window.excalidrawDesktop.saveDrawing(id, snapshot);
+      } else {
+        const contents = await window.excalidrawDesktop.readDrawing(id);
+        const savedAppState = JSON.parse(contents).appState || {};
+        const data = await loadFromBlob(
+          new Blob([contents], { type: "application/json" }),
+          excalidrawAPI.getAppState(),
+          excalidrawAPI.getSceneElementsIncludingDeleted(),
+        );
+        if (data.files) {
+          excalidrawAPI.addFiles(Object.values(data.files));
+        }
+        excalidrawAPI.updateScene({
+          elements: restoreElements(data.elements, null, {
+            repairBindings: true,
+            deleteInvisibleElements: true,
+          }),
+          appState: restoreAppState(
+            {
+              ...data.appState,
+              name: savedAppState.name || "Untitled drawing",
+            },
+            null,
+          ),
+          captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+        });
+      }
+      setErrorMessage("");
+      setIsDesktopLibraryOpen(false);
+    } catch (error) {
+      console.error(error);
+      if (!isNew) {
+        desktopDrawingIdRef.current = null;
+        desktopSnapshotRef.current = null;
+      }
+      setDesktopSaveStatus("error");
+      setErrorMessage(
+        "Could not open or save the drawing. Check the file and folder permissions, then retry.",
+      );
+      setIsDesktopLibraryOpen(true);
+    }
+  };
+
+  const handleDesktopSaveStatusClick = () => {
+    const id = desktopDrawingIdRef.current;
+    const snapshot = desktopSnapshotRef.current;
+    if (
+      desktopSaveStatus === "error" &&
+      id &&
+      snapshot &&
+      window.excalidrawDesktop
+    ) {
+      setDesktopSaveStatus("saving");
+      window.excalidrawDesktop
+        .saveDrawing(id, snapshot)
+        .then(() => setDesktopSaveStatus("saved"))
+        .catch(() => setDesktopSaveStatus("error"));
+      return;
+    }
+    setIsDesktopLibraryOpen(true);
   };
 
   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
@@ -907,48 +1141,9 @@ const ExcalidrawWrapper = () => {
     );
   }
 
-  const ExcalidrawPlusCommand = {
-    label: "Excalidraw+",
-    category: DEFAULT_CATEGORIES.links,
-    predicate: true,
-    icon: <div style={{ width: 14 }}>{ExcalLogo}</div>,
-    keywords: ["plus", "cloud", "server"],
-    perform: () => {
-      window.open(
-        `${
-          import.meta.env.VITE_APP_PLUS_LP
-        }/plus?utm_source=excalidraw&utm_medium=app&utm_content=command_palette`,
-        "_blank",
-      );
-    },
-  };
-  const ExcalidrawPlusAppCommand = {
-    label: "Sign up",
-    category: DEFAULT_CATEGORIES.links,
-    predicate: true,
-    icon: <div style={{ width: 14 }}>{ExcalLogo}</div>,
-    keywords: [
-      "excalidraw",
-      "plus",
-      "cloud",
-      "server",
-      "signin",
-      "login",
-      "signup",
-    ],
-    perform: () => {
-      window.open(
-        `${
-          import.meta.env.VITE_APP_PLUS_APP
-        }?utm_source=excalidraw&utm_medium=app&utm_content=command_palette`,
-        "_blank",
-      );
-    },
-  };
-
   return (
     <div
-      style={{ height: "100%" }}
+      style={{ height: "100%", position: "relative" }}
       className={clsx("excalidraw-app", {
         "is-collaborating": isCollaborating,
       })}
@@ -966,30 +1161,6 @@ const ExcalidrawWrapper = () => {
             toggleTheme: true,
             export: {
               onExportToBackend,
-              renderCustomUI: excalidrawAPI
-                ? (elements, appState, files) => {
-                    return (
-                      <ExportToExcalidrawPlus
-                        elements={elements}
-                        appState={appState}
-                        files={files}
-                        name={excalidrawAPI.getName()}
-                        onError={(error) => {
-                          excalidrawAPI?.updateScene({
-                            appState: {
-                              errorMessage: error.message,
-                            },
-                          });
-                        }}
-                        onSuccess={() => {
-                          excalidrawAPI.updateScene({
-                            appState: { openDialog: null },
-                          });
-                        }}
-                      />
-                    );
-                  }
-                : undefined,
             },
           },
         }}
@@ -1007,12 +1178,6 @@ const ExcalidrawWrapper = () => {
 
           return (
             <div className="excalidraw-ui-top-right">
-              {excalidrawAPI?.getEditorInterface().formFactor === "desktop" && (
-                <ExcalidrawPlusPromoBanner
-                  isSignedIn={isExcalidrawPlusSignedUser}
-                />
-              )}
-
               {collabError.message && <CollabError collabError={collabError} />}
               <LiveCollaborationTrigger
                 isCollaborating={isCollaborating}
@@ -1041,6 +1206,13 @@ const ExcalidrawWrapper = () => {
           isCollabEnabled={isCollabAvailable}
           theme={appTheme}
           refresh={() => forceRefresh((prev) => !prev)}
+          onOpenDrawingLibrary={() => {
+            setIsDesktopLibraryOpen(true);
+            void flushDesktopPendingSave().catch((error) => {
+              console.error(error);
+              setErrorMessage("Could not save the latest changes to disk.");
+            });
+          }}
         />
         <AppWelcomeScreen
           onCollabDialogOpen={onCollabDialogOpen}
@@ -1049,22 +1221,6 @@ const ExcalidrawWrapper = () => {
         <OverwriteConfirmDialog>
           <OverwriteConfirmDialog.Actions.ExportToImage />
           <OverwriteConfirmDialog.Actions.SaveToDisk />
-          {excalidrawAPI && (
-            <OverwriteConfirmDialog.Action
-              title={t("overwriteConfirm.action.excalidrawPlus.title")}
-              actionLabel={t("overwriteConfirm.action.excalidrawPlus.button")}
-              onClick={() => {
-                exportToExcalidrawPlus(
-                  excalidrawAPI.getSceneElements(),
-                  excalidrawAPI.getAppState(),
-                  excalidrawAPI.getFiles(),
-                  excalidrawAPI.getName(),
-                );
-              }}
-            >
-              {t("overwriteConfirm.action.excalidrawPlus.description")}
-            </OverwriteConfirmDialog.Action>
-          )}
         </OverwriteConfirmDialog>
         <AppFooter onChange={() => excalidrawAPI?.refresh()} />
         {excalidrawAPI && <AIComponents excalidrawAPI={excalidrawAPI} />}
@@ -1107,8 +1263,6 @@ const ExcalidrawWrapper = () => {
             }
           }}
         />
-
-        <AppSidebar />
 
         {errorMessage && (
           <ErrorDialog onClose={() => setErrorMessage("")}>
@@ -1255,32 +1409,6 @@ const ExcalidrawWrapper = () => {
                 );
               },
             },
-            ...(isExcalidrawPlusSignedUser
-              ? [
-                  {
-                    ...ExcalidrawPlusAppCommand,
-                    label: "Sign in / Go to Excalidraw+",
-                  },
-                ]
-              : [ExcalidrawPlusCommand, ExcalidrawPlusAppCommand]),
-
-            {
-              label: t("overwriteConfirm.action.excalidrawPlus.button"),
-              category: DEFAULT_CATEGORIES.export,
-              icon: exportToPlus,
-              predicate: true,
-              keywords: ["plus", "export", "save", "backup"],
-              perform: () => {
-                if (excalidrawAPI) {
-                  exportToExcalidrawPlus(
-                    excalidrawAPI.getSceneElements(),
-                    excalidrawAPI.getAppState(),
-                    excalidrawAPI.getFiles(),
-                    excalidrawAPI.getName(),
-                  );
-                }
-              },
-            },
             {
               label: t("labels.installPWA"),
               category: DEFAULT_CATEGORIES.app,
@@ -1306,17 +1434,57 @@ const ExcalidrawWrapper = () => {
           />
         )}
       </Excalidraw>
+      {isDesktopApp && !isDesktopLibraryOpen && (
+        <button
+          className="desktop-save-status"
+          data-status={desktopSaveStatus}
+          onClick={handleDesktopSaveStatusClick}
+          title="Open your saved drawings"
+        >
+          <span aria-hidden="true">
+            {desktopSaveStatus === "saved"
+              ? "✓"
+              : desktopSaveStatus === "saving"
+              ? "◌"
+              : "!"}
+          </span>
+          {desktopSaveStatus === "saved"
+            ? "Saved"
+            : desktopSaveStatus === "saving"
+            ? "Saving…"
+            : "Save failed — retry"}
+          <span className="desktop-save-status__library">Drawings</span>
+        </button>
+      )}
+      {isDesktopLibraryOpen && isDesktopApp && (
+        <DesktopLibrary
+          saveError={errorMessage}
+          onRetrySave={() => {
+            const id = desktopDrawingIdRef.current;
+            const snapshot = desktopSnapshotRef.current;
+            if (!id || !snapshot || !window.excalidrawDesktop) {
+              return;
+            }
+            setDesktopSaveStatus("saving");
+            window.excalidrawDesktop
+              .saveDrawing(id, snapshot)
+              .then(() => {
+                setDesktopSaveStatus("saved");
+                setErrorMessage("");
+              })
+              .catch((error) => {
+                console.error(error);
+                setDesktopSaveStatus("error");
+              });
+          }}
+          onOpen={(id, isNew) => void openDesktopDrawing(id, isNew)}
+        />
+      )}
     </div>
   );
 };
 
 const ExcalidrawApp = () => {
-  const isCloudExportWindow =
-    window.location.pathname === "/excalidraw-plus-export";
-  if (isCloudExportWindow) {
-    return <ExcalidrawPlusIframeExport />;
-  }
-
   return (
     <TopErrorBoundary>
       <Provider store={appJotaiStore}>

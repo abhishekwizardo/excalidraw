@@ -144,10 +144,11 @@ export default defineConfig(({ mode }) => {
   const mermaidChunkFileNames = new Set<string>();
   // https://vitejs.dev/config/
   return {
+    base: mode === "desktop" ? "./" : "/",
     server: {
       port: Number(envVars.VITE_APP_PORT || 3000),
       // open the browser
-      open: true,
+      open: mode !== "desktop",
     },
     // We need to specify the envDir since now there are no
     //more located in parallel with the vite.config.ts file but in parent dir
@@ -299,6 +300,7 @@ export default defineConfig(({ mode }) => {
       svgrPlugin(),
       ViteEjsPlugin(),
       VitePWA({
+        disable: mode === "desktop",
         registerType: "autoUpdate",
         devOptions: {
           /* set this flag to true to enable in Development mode */

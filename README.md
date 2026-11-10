@@ -80,6 +80,19 @@ The app hosted at [excalidraw.com](https://excalidraw.com) is a minimal showcase
 
 We'll be adding these features as drop-in plugins for the npm package in the future.
 
+## Desktop application
+
+This repository also includes an Electron desktop wrapper named **Excalidraw Local**. It stores drawings as `.excalidraw` files in `Documents/Excalidraw Drawings` by default and can package an installer for the current operating system.
+
+To develop or package the desktop app, install the repository dependencies with Yarn and use:
+
+```bash
+yarn desktop:dev
+yarn desktop:package
+```
+
+Packaged installers are written to `release/`. See [desktop/README.md](desktop/README.md) for storage details and platform notes.
+
 ## Quick start
 
 **Note:** following instructions are for installing the Excalidraw [npm package](https://www.npmjs.com/package/@excalidraw/excalidraw) when integrating Excalidraw into your own app. To run the repository locally for development, please refer to our [Development Guide](https://docs.excalidraw.com/docs/introduction/development).
